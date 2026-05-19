@@ -39,7 +39,7 @@ unsigned long lastMillis = 0;
 // Triggers
 bool isButtonPressed;
 
-float lastCommandUpdated = 0;
+String lastCommandUpdated = "";
 String lastCommandDate = "";
 
 // Limite puesto de tolerancia del voltaje
@@ -57,12 +57,22 @@ float limit_volt = 150.0;
   0 = none (on, off)
   1 = voltaje (off)
   2 = button (on, off)
-  3 = schedule (on, off)
   4 = command (on, off)
 
 */
 int output_status = 0;
 int switch_status = 0;
+
+
+unsigned long timeDelayOverVolt = 0;
+int nextOutputStatusOverVolt = 0;
+int nextSwitchStatusOverVolt = 0;
+
+unsigned long timeCounter = 0;
+int finalOutputStatusTimeCounter = 0;
+bool isTimeCounter = false;
+
+String lastRetroMessage = String("");
 
 bool test_mode = false;
 
@@ -103,7 +113,7 @@ void loop(){
   check_button();
   
   // Leer el valor del voltaje cada segundo
-  if(millis() - waitVoltRegister > 500){
+  if(millis() - waitVoltRegister > 100){
     waitVoltRegister = millis();
     check_volt();
   }
@@ -115,7 +125,37 @@ void loop(){
   }
 
   // Imprimir al final el valor que se tuvo a la salida del switch
-  digitalWrite(pinOutput, output_status);
+  REP_CHECK:
+  int real_output = output_status;
+  if(timeDelayOverVolt == 0){
+    if(isTimeCounter){
+      if(timeCounter > millis() - lastMillis){
+        timeCounter = timeCounter - (millis() - lastMillis);
+      }
+      else{
+        timeCounter = 0;
+        isTimeCounter = false;
+        output_status = finalOutputStatusTimeCounter;
+        real_output = output_status;
+        switch_status = 0;
+      }
+    }
+  }
+  else{
+    output_status = 0;
+    switch_status = 1;
+    real_output = output_status;
+    if(timeDelayOverVolt > millis() - lastMillis) {
+      timeDelayOverVolt = timeDelayOverVolt - (millis() - lastMillis);
+    }
+    else{
+      timeDelayOverVolt = 0;
+      output_status = nextOutputStatusOverVolt;
+      switch_status = nextSwitchStatusOverVolt;
+      goto REP_CHECK;
+    }
+  }
+  digitalWrite(pinOutput, real_output);
 
   lastMillis = millis();
 }
@@ -135,7 +175,6 @@ void write_results(){
   float max = -1;
   float sum = 0;
   float prom = 0;
-  String lastLedMessage = String("");
 
   for(int i = 0; i < volt_values.size(); i++){
     sum +=volt_values[i];
@@ -148,26 +187,6 @@ void write_results(){
   }
   prom = sum/volt_values.size();
 
-  lastCommandUpdated = ThingSpeak.readFloatField(channel_id, 7, read_API_key);
-  lastCommandDate = ThingSpeak.getCreatedAt();
-  //OFF
-  if(lastCommandUpdated == 0 || lastCommandUpdated < 0){
-    lastLedMessage = String("Led OFF.");
-    digitalWrite(pinOutput, LOW);
-    blinkingAt = 0;
-  }
-  //ON
-  else if(lastCommandUpdated == 1){
-    lastLedMessage = String("Led ON.");
-    digitalWrite(pinOutput, HIGH);
-    blinkingAt = 0;
-  }
-  //BLINK
-  else{
-    lastLedMessage = String("Led BLINK at: ")+blinkingAt+String("Hz.");
-    blinkingAt = lastCommandUpdated;
-  }
-
 
   ThingSpeak.setField(1, prom);
   ThingSpeak.setField(2, max);
@@ -176,10 +195,11 @@ void write_results(){
     ThingSpeak.setField(4, offline_data.get_last_Json());
     offline_data.remove_last_result();
   }
-  ThingSpeak.setField(5, countPressed);
-  ThingSpeak.setField(6, countDoublePressed);
-  if(!lastLedMessage.equals(String(""))){
-    ThingSpeak.setField(8, lastLedMessage);
+  if(!lastRetroMessage.equals(String(""))){
+    ThingSpeak.setField(5, String("MENSAJE DE LA SWITCH:\n")+lastRetroMessage);
+  }
+  else{
+    ThingSpeak.setField(5, " ");
   }
   int code = ThingSpeak.writeFields(channel_id, write_API_key);
 
@@ -187,15 +207,136 @@ void write_results(){
     //Serial.println("Erroooooooor ");
     offline_data.add_results(prom, max, min);
   }
+  else{
+    lastRetroMessage = String("");
+  }
+
+  // Leer el último comando en el field de comandos
+  lastCommandUpdated = ThingSpeak.readStringField(channel_id, 5, read_API_key);
+  lastCommandUpdated.trim();
+  lastCommandUpdated.toLowerCase();
+  String currentComandDate = ThingSpeak.getCreatedAt();
+  currentComandDate.trim();
+  Serial.print("Revisando comandos...\t");
+  Serial.println(lastCommandUpdated);
+
+  {
+    //OFF
+    if(lastCommandUpdated.equals(String("off"))){
+      Serial.println("Comando \"off\" dado...");
+      reset_time_counter();
+      if(timeDelayOverVolt == 0){
+        output_status = 0;
+        switch_status = 4;
+      }
+      else{
+        nextOutputStatusOverVolt = 0;
+        nextSwitchStatusOverVolt = 4;
+      }
+    }
+    //ON
+    else if(lastCommandUpdated.equals(String("on"))){
+      Serial.println("Comando \"on\" dado...");
+      reset_time_counter();
+      if(timeDelayOverVolt == 0){
+        output_status = 1;
+        switch_status = 4;
+      }
+      else{
+        Serial.println(timeDelayOverVolt);
+        nextOutputStatusOverVolt = 1;
+        nextSwitchStatusOverVolt = 4;
+      }
+    }
+    //contador OFF
+    else if(lastCommandUpdated.startsWith("coff") && lastCommandUpdated.indexOf("=") > 0){
+      Serial.println("Comando \"coff\" dado...");
+      String s_value = lastCommandUpdated.substring(lastCommandUpdated.indexOf("=") + 1);
+      float value = s_value.toFloat();
+      if(timeDelayOverVolt == 0){
+        output_status = 0;
+        switch_status = 4;
+      }
+      else{
+        nextOutputStatusOverVolt = 0;
+        nextSwitchStatusOverVolt = 4;
+      }
+      set_time_counter(value*1000.0, 1);
+    }
+    //contador ON
+    else if(lastCommandUpdated.startsWith("con") && lastCommandUpdated.indexOf("=") > 0){
+      Serial.println("Comando \"con\" dado...");
+      String s_value = lastCommandUpdated.substring(lastCommandUpdated.indexOf("=") + 1);
+      float value = s_value.toFloat();
+      if(timeDelayOverVolt == 0){
+        output_status = 1;
+        switch_status = 4;
+      }
+      else{
+        nextOutputStatusOverVolt = 1;
+        nextSwitchStatusOverVolt = 4;
+      }
+      set_time_counter(value*1000.0, 0);
+    }
+    //limite de voltaje
+    else if(lastCommandUpdated.startsWith("lv") && lastCommandUpdated.indexOf("=") > 0){
+      Serial.println("Comando \"lv\" dado...");
+      String s_value = lastCommandUpdated.substring(lastCommandUpdated.indexOf("=") + 1);
+      float value = s_value.toFloat();
+      limit_volt = value;
+    }
+    //Pedir status
+    else if(lastCommandUpdated.startsWith(String("status"))){
+      Serial.println("Comando \"status\" dado...");
+      lastRetroMessage = String("");
+      switch (switch_status) {
+        case 1:{
+          lastRetroMessage += String("Apagado por subida de voltaje\n");
+          break;
+        }
+        case 2:{
+          lastRetroMessage += String("Ultimo cambio por el boton fisico\n");
+          break;
+        }
+        case 4:{
+          lastCommandDate += String("Ultimo cambio por comando\n");
+          break;
+        }
+      }
+
+      if(isTimeCounter){
+        lastRetroMessage = String("Contador asignado con un tiempo restante de: ");
+        lastRetroMessage += String(timeCounter);
+        lastRetroMessage += String("ms\n");
+      }
+
+      if(output_status){
+        lastRetroMessage += String("Salida: HABILITADA\n");
+      }
+      else{
+        lastRetroMessage += String("Salida: DESHABILITADA\n");
+      }
+    }
+    // comando HELP
+    else if(lastCommandUpdated.equals(String("help"))){
+      Serial.println("Comando \"help\" dado...");
+      lastRetroMessage = String("");
+      lastRetroMessage += String("COMANDOS: - on - off - coff=<seg> - con=<seg> - lv=<volt> - status");
+    }
+  }
+  lastCommandDate = ThingSpeak.getCreatedAt();
+  lastCommandDate.trim();
 
   volt_values.clear();
 }
 
 void check_button(){
-   if(digitalRead(pinButton) == HIGH && !isButtonPressed){
+  if(digitalRead(pinButton) == HIGH && !isButtonPressed){
+    Serial.println("boton: 1");
     isButtonPressed = true;
   }
   if(digitalRead(pinButton) == LOW && isButtonPressed){
+    Serial.println("boton: 0");
     isButtonPressed = false;
     switch_status = 2;
     if(output_status == 1){
@@ -204,10 +345,31 @@ void check_button(){
     else{
       output_status = 1;
     }
-  } 
+  }
 }
 
 void check_volt(){
   int voltLectura = analogRead(pinVolt);
-  volt_values.push_back(map(voltLectura, 0.0, 4095.0, 0.0, 100.0));
+  float volt_val = map(voltLectura, 0.0, 4095.0, 0.0, 500.0);
+  volt_values.push_back(volt_val);
+  if(volt_val >= limit_volt){
+    if(timeDelayOverVolt == 0){
+      nextOutputStatusOverVolt = output_status;
+      nextSwitchStatusOverVolt = switch_status;
+    }
+    timeDelayOverVolt = 5000;
+    output_status = 0;
+    switch_status = 1;
+  }
+}
+
+void reset_time_counter(){
+  timeCounter = 0;
+  isTimeCounter = false;
+}
+
+void set_time_counter(float time, int finalOutputResult){
+  timeCounter = String(time).toDouble();
+  finalOutputStatusTimeCounter = finalOutputResult;
+  isTimeCounter = true;
 }
